@@ -17,33 +17,71 @@ Also, it should be very good if you could describe the approaches setting up the
 and maintaining it in cases that there is need for a change to it. 
 How about information security. Are there some kind of approaches that you would prefer?
 ___
-**assumptions:**
-The assumption is that the customer for whom we are building the integration platform is responsible for data producers.
-(in real case, those would be verified with the client)
-Therefore, it is assumed the data source is inside the cloud or AWS SDK is used to write data to appropriate service in AWS.
 
-> **Note:** the selection of the services and the final design would also depend on the specific requirements, type of data and other factors that are unknown to me
+The solution represents a simple integration platform which delivers messages (JSONs) to consumers. 
+The consumers can be subscribed for a topic by providing an HTTPS endpoint. The platform sends batches of data published in the topic to defined HTTPS endpoint.
+Alternatively, an API exposes the integration and allows consumers request data using GET HTTPS request or use GraphQL to define parameters to be returned.
+
+The platform presented as solution is built in AWS cloud.
+
+> **Note:** the selection of the services and the final design would depend on the specific requirements, type of data and other factors that are unknown to me
 ___
-The suggested solution utilizes Kinesis Data Streams service provided by AWS. 
-An alternative could be SQS. However, Kinesis has few advantages over it such as possibility to have multiple consumer applications and promised better performance.
+**Solution description:**
 
-In Kinesis Data Streams, data is ordered based on the arrival in the service and expires after retention period passed. 
-The default retention period (24 hours) should be sufficient - meaning each data item in the service is automatically removed after one day.
+Data can come to the platform from various sources such as
+- MQTT message broker
+- published directly with AWS SDK (i.e. boto3 for Python)
+- sent via HTTP(S)
+- etc.
 
-The horizontal scalability in Kinesis Data Streams is achieved with shards. Data is distributed in multiple shards and its number can be adjusted base on the amount of data. Each shard is independent and failure in one does not affect the other. Also, they are replicated over multiple availability zones achieving redundancy and high availability.
-A partition key needs to be chosen well to achieve good utilisation of shards. In case of need to read data directly from Kinesis Data Streams, knowing the partition key value might be helpful to determine in which shard the data is stored (MD5 algorithm and 128-bit integer hash key is used to calculate hash key).
-However, reading data directly from Kinesis Data Streams (at least with boto3 AWS SDK) is inefficient and slow (I compared the performance with other options in [research paper](ICSA2025_pre_submit.pdf)).
+No matter where data originates from, it is ingested by Kinesis Data Streams service. 
+In our simple case, each message is assigned to a topic. The selection of what attribute is used as topic or how the value is determined would depend on specific application. In our case, we can assume, it is identifier of the data producer.
 
-While data is in data streams, it can be processed by consumer applications. Consumer applications read data from shards and use shard iterators to continue in processing the data where they stopped.
+In Kinesis Data Streams, the topic would be used as a partition key. 
+Therefore, messages with the same topic would share the same shard.
 
-I would suggest to handle data separately for synchronous and asynchronous approach of data delivery. This would provide isolation to ensure that if something goes wrong in one, the other one is not blocked.
+We assume the messages are relatively small and we do not need to consider their size. This allows us to use SNS service to send data to consumers via HTTPS (kind of webhook).
+Data is sent to SNS to specific topic which matches the topics of our data items. SNS sends data to consumers via HTTPSs which are defined per topic.
 
-For **synchronous** approach, I would use data stores. In case of time-series data, I would prefer specialized time-series database (i.e. Timestream) which would allow to leverage from extensive query options and built-in time-series functions. Also, tools like Grafana work well with Timestream.
-Otherwise, I would use KV NoSQL database DynamoDB. A benefit is high horizontal scalability (data is distributed into partitions based on partition key) and ability to handle heterogeneous data - the structure does not need to be known (ideal for messages in JSON format).
-The data in data stores would not be stored permanently. Retention period or time-to-live would be set to achieve automatic data deletion after some time so data store does not grow too big and does not generate unnecessarily high cost.
+Alternatively, I would implement a custom webhook functionality giving me more control in deciding how and where data is sent and also more flexibility about the message size and other SNS limitations ([ref](https://docs.aws.amazon.com/general/latest/gr/sns.html)).
+A lambda function would make the job. Also, topics in SNS are strictly defined, meaning, creating topics dynamically could be troublesome.
 
-A simple endpoint could be implemented using API Gateway and lambda functions. For synchronous data delivery, consumers could call the endpoint which would query recent data from the data stores.
-I would prefer using API keys for authentication (due to simplicity and easiness of their use), and distribute them individually to the parties using the integration platform.
-Of course, all data transfer would be secured and use HTTPS protocol.
-Alternatively, to achieve higher security, I would opt for Oauth 2.0 with Client Key and Client secret (for M2M) as described [here](https://aws.amazon.com/blogs/mt/configuring-machine-to-machine-authentication-with-amazon-cognito-and-amazon-api-gateway-part-2/).
+Anyway, lambda function is needed to process data from Kinesis Data Stream and direct it to SNS as SNS can't be direct consumer of Kinesis Data Streams.
 
+For synchronous data delivery, data stores are used. 
+For heterogeneous data (likely case of JSONs as in task description), the best bet would be DynamoDB key-value NoSQL database.
+
+In case of time-series data and need to monitor it, I would use Timestream, specialized time-series database providing extensive query options and built-in time-series functions such as interpolation. Additionally, it is well integrated with visualisation tools like Grafana.
+However, if none of those benefits of Timestream could be leveraged, I would still go with DynamoDB and optimize table for handling time-series data (timestamp as sort key, well-chosen partition key).
+I compared DynamoDB and Timestream, with partitioning taken into account, in my [research paper](ICSA2025_pre_submit.pdf)
+
+Theoretically, data could be retrieved directly from Kinesis Data Streams. However, as also described in my [research paper](ICSA2025_pre_submit.pdf), it is slow and not efficient.
+Therefore, a data store is used. It simplifies and speeds up data retrieval times. Since data is retrieved from specific topic and the topic can be used as partition key in DynamoDB, there is no need to do slow operations over multiple nodes (partitions). Instead, more efficient query operation can be used that retrieves data from specific node by partition key (topic).
+
+Data stores can have time-to-live or retention period enabling automatic deletion of data item after specific time avoiding unnecessary costs.
+For ling-time data storage, Amazon Data Firehose can be attached to Kinesis Data Streams and flush data into S3 service.
+
+The API layer consists of API Gateway and a lambda function that queries data from data store. For authorisation and authentication, Amazon Cognito can be used.
+My preferred option would be Oauth 2.0 with Client Key and Client secret (for M2M). In small and simpler system, due to simplicity and easiness of use I would opt for API Keys.
+Amazon Cognito can tag users and define access control list (ACL). Therefore, specific users could be granted access only to specific topics.
+
+It is also possible for client to subscribe to topic and let SNS to send data to provided HTTPS endpoint.
+___
+
+**Scalability and redundancy:**
+The main service in the solution is Kinesis Data Streams. Its high horizontal scalability is achieved with shards. Based on the partition key (its 128-bit integer MD5 hash) data is assigned to specific shard.
+The service can be scaled up or down by adding/removing shards. High availability and redundancy is achieved by shards being independent. Failure in one does not affect other. Also, they can be replicated in multiple availability zones.
+
+Data Store (DynamoDB) keeps data in partitions. This also represents a great horizontal scalability.
+
+Lambda function is also designed for good scalability by adding more concurrent executions and execution environments.
+
+Suggested solution is presented below:
+![integration platform design](design.png)
+
+To provision the services, I would use Terraform. The Terraform state file I would host in S3 service.
+Github actions or alternative could take care of applying changes performed in the Terraform and merged into main branch on GitHub.
+
+The security would be achieved by using secured protocols for communication and data transfers. Inside the cloud environments, only necessary roles would have permission to perform only necessary actions in specific services. This should be the rule of thumb.
+Granted tokens should have reasonably short validity and option to revoke already granted token (revoke it) could be implemented.
+Ability to revoke granted tokens should be used if suspicious activity is identified.
